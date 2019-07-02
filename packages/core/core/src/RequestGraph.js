@@ -3,15 +3,11 @@ import invariant from 'assert';
 //$FlowFixMe
 import {isMatch} from 'micromatch';
 import nullthrows from 'nullthrows';
+import path from 'path';
 
-import {PromiseQueue, md5FromString} from '@parcel/utils';
-import type {
-  AssetRequest,
-  ConfigRequest,
-  FilePath,
-  Glob,
-  ParcelOptions
-} from '@parcel/types';
+import {localResolve} from '@parcel/local-require';
+import {PromiseQueue, md5FromString, md5FromObject} from '@parcel/utils';
+import type {AssetRequest, FilePath, Glob, ParcelOptions} from '@parcel/types';
 import type {Event} from '@parcel/watcher';
 import WorkerFarm from '@parcel/workers';
 
@@ -24,8 +20,10 @@ import ResolverRunner from './ResolverRunner';
 import type InternalAsset from './Asset';
 import type {
   AssetRequestNode,
+  ConfigRequest,
   ConfigRequestNode,
   DepPathRequestNode,
+  DepVersionRequestNode,
   GlobNode,
   NodeId,
   RequestGraphNode,
@@ -66,6 +64,12 @@ const nodeFromConfigRequest = (configRequest: ConfigRequest) => ({
   ),
   type: 'config_request',
   value: configRequest
+});
+
+const nodeFromDepVersionRequest = depVersionRequest => ({
+  id: md5FromObject(depVersionRequest),
+  type: 'dep_version_request',
+  value: depVersionRequest
 });
 
 const nodeFromFilePath = (filePath: string) => ({
@@ -188,6 +192,9 @@ export default class RequestGraph extends Graph<RequestGraphNode> {
       case 'config_request':
         promise = this.runConfigRequest(requestNode);
         break;
+      case 'dep_version_request':
+        promise = this.runDepVersionRequest(requestNode);
+        break;
       default:
       // Do nothing
     }
@@ -202,7 +209,7 @@ export default class RequestGraph extends Graph<RequestGraphNode> {
       } catch (e) {
         // Do nothing
         // Main tasks will be caught by the queue
-        // Sun tasks will end up rejecting the main task promise
+        // Sub tasks will end up rejecting the main task promise
       }
     }
   }
@@ -211,7 +218,7 @@ export default class RequestGraph extends Graph<RequestGraphNode> {
     try {
       let start = Date.now();
       let request = requestNode.value;
-      let assets = await this.runTransform({
+      let {assets, configRequests} = await this.runTransform({
         request,
         loadConfig: this.loadConfigHandle,
         parentNodeId: requestNode.id,
@@ -222,6 +229,16 @@ export default class RequestGraph extends Graph<RequestGraphNode> {
       for (let asset of assets) {
         asset.stats.time = time;
       }
+
+      let configRequestNodes = configRequests.map(configRequest => {
+        let id = nodeFromConfigRequest(configRequest).id;
+        return nullthrows(this.getNode(id));
+      });
+      this.replaceNodesConnectedTo(
+        requestNode,
+        configRequestNodes,
+        'config_request'
+      );
 
       return assets;
     } catch (e) {
@@ -247,13 +264,28 @@ export default class RequestGraph extends Graph<RequestGraphNode> {
 
   async loadConfig(configRequest: ConfigRequest, parentNodeId: NodeId) {
     let configRequestNode = nodeFromConfigRequest(configRequest);
-    if (!this.hasNode(configRequestNode.id)) this.addNode(configRequestNode);
-    if (!this.hasEdge(parentNodeId, configRequestNode.id))
-      this.addEdge(parentNodeId, configRequestNode.id);
+    this.ensureConnection(this.getNode(parentNodeId), configRequestNode);
 
-    let config = await this.getSubTaskResult(configRequestNode);
+    let config = nullthrows(await this.getSubTaskResult(configRequestNode));
 
-    // TODO: add DepVersionRequests to invalidate when plugins change
+    let depVersionRequestNodes = [];
+    for (let [moduleSpecifier] of config.devDeps) {
+      let depVersionRequest = {
+        moduleSpecifier,
+        resolveFrom: path.dirname(nullthrows(config.resolvedPath)) // TODO: resolveFrom should be nearest package boundary
+      };
+      let depVersionRequestNode = nodeFromDepVersionRequest(depVersionRequest);
+      this.ensureConnection(configRequestNode, depVersionRequestNode);
+      depVersionRequestNodes.push(this.getNode(depVersionRequestNode.id));
+
+      let version = await this.getSubTaskResult(depVersionRequestNode);
+      config.setDevDep(depVersionRequest.moduleSpecifier, version);
+    }
+    this.replaceNodesConnectedTo(
+      configRequestNode,
+      depVersionRequestNodes,
+      'dep_version_request'
+    );
 
     return config;
   }
@@ -277,9 +309,24 @@ export default class RequestGraph extends Graph<RequestGraphNode> {
       invalidationNodes.push(nodeFromGlob(config.watchGlob));
     }
 
-    this.replaceNodesConnectedTo(configRequestNode, invalidationNodes);
+    this.replaceNodesConnectedTo(configRequestNode, invalidationNodes, 'file');
 
     return config;
+  }
+
+  async runDepVersionRequest(requestNode: DepVersionRequestNode) {
+    let {value: request} = requestNode;
+    let {moduleSpecifier, resolveFrom} = request;
+    let [, resolvedPkg] = await localResolve(
+      `${moduleSpecifier}/package.json`,
+      `${resolveFrom}/index`
+    );
+
+    // TODO: Figure out how to handle when local plugin packages change, since version won't be enough
+    let version = nullthrows(resolvedPkg).version;
+    request.result = version;
+
+    return version;
   }
 
   addSubRequest(subRequestNode: SubRequestNode, nodeId: NodeId) {
@@ -308,7 +355,9 @@ export default class RequestGraph extends Graph<RequestGraphNode> {
 
   getResultFromGraph(subRequestNode: SubRequestNode) {
     let node = nullthrows(this.getNode(subRequestNode.id));
-    invariant(node.type === 'config_request');
+    invariant(
+      node.type === 'config_request' || node.type === 'dep_version_request'
+    );
     return nullthrows(node.value.result);
   }
 
@@ -340,7 +389,8 @@ export default class RequestGraph extends Graph<RequestGraphNode> {
       case 'dep_path_request':
         this.invalidNodes.set(node.id, node);
         break;
-      case 'config_request': {
+      case 'config_request':
+      case 'dep_version_request': {
         this.invalidNodes.set(node.id, node);
         let mainRequestNode = nullthrows(this.getMainRequestNode(node));
         this.invalidNodes.set(mainRequestNode.id, mainRequestNode);
@@ -354,13 +404,17 @@ export default class RequestGraph extends Graph<RequestGraphNode> {
   }
 
   getMainRequestNode(node: SubRequestNode) {
-    if (node.type === 'config_request') {
-      let [mainRequestNode] = this.getNodesConnectedTo(node);
-      invariant(
-        mainRequestNode.type !== 'file' && mainRequestNode.type !== 'glob'
-      );
-      return mainRequestNode;
-    }
+    // let [parentNode] = this.getNodesConnectedTo(node);
+    // if (parentNode.type === 'config_request') {
+    //   [parentNode] = this.getNodesConnectedTo(parentNode);
+    // }
+    // invariant(parentNode.type !== 'file' && parentNode.type !== 'glob');
+    // return parentNode;
+    let [mainRequestNode] = this.getNodesConnectedTo(node);
+    invariant(
+      mainRequestNode.type !== 'file' && mainRequestNode.type !== 'glob'
+    );
+    return mainRequestNode;
   }
 
   // TODO: add edge types to make invalidation more flexible and less precarious

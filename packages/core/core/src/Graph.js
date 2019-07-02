@@ -85,6 +85,20 @@ export default class Graph<TNode: Node> {
     return this.outboundEdges.get(from).has(to);
   }
 
+  ensureConnection(fromNode: Node, toNode: Node) {
+    if (!this.hasNode(fromNode.id)) {
+      this.addNode(fromNode);
+    }
+
+    if (!this.hasNode(toNode.id)) {
+      this.addNode(toNode);
+    }
+
+    if (!this.hasEdge(fromNode.id, toNode.id)) {
+      this.addEdge(fromNode.id, toNode.id);
+    }
+  }
+
   getNodesConnectedTo(node: TNode): Array<TNode> {
     return Array.from(this.inboundEdges.get(node.id).values()).map(from =>
       nullthrows(this.nodes.get(from))
@@ -159,8 +173,18 @@ export default class Graph<TNode: Node> {
 
   // Update a node's downstream nodes making sure to prune any orphaned branches
   // Also keeps track of all added and removed edges and nodes
-  replaceNodesConnectedTo(fromNode: TNode, toNodes: Array<TNode>): void {
-    let childrenToRemove = new Set(this.outboundEdges.get(fromNode.id));
+  replaceNodesConnectedTo(
+    fromNode: TNode,
+    toNodes: Array<TNode>,
+    nodeType?: string
+  ): void {
+    let childrenToRemove = new Set(
+      [...this.outboundEdges.get(fromNode.id)].filter(
+        toNodeId =>
+          nodeType == null ||
+          nodeType === nullthrows(this.nodes.get(toNodeId)).type
+      )
+    );
     for (let toNode of toNodes) {
       let existingNode = this.getNode(toNode.id);
       if (!existingNode) {
